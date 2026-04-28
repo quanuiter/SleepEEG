@@ -1,4 +1,4 @@
-#Deep Learning Optimization for Single-Channel EEG Sleep Staging
+##Deep Learning Optimization for Single-Channel EEG Sleep Staging
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
@@ -109,17 +109,7 @@ python train_conformer.py
 
 ---
 
-## Visualizations
-
-| Confusion Matrix (TCN) | Hypnogram |
-|:---:|:---:|
-| *(Insert cm_tcn.png)* | *(Insert hypnogram.png)* |
-
-> Tip: Upload your confusion matrix and hypnogram plots to the repo and replace the placeholders above with the image paths.
-
----
-
-## 📝 Acknowledgments
+## Acknowledgments
 
 - Dataset: [PhysioNet Sleep-EDF Database](https://physionet.org/content/sleep-edfx/1.0.0/)
 - Conformer architecture inspired by [Gulati et al., 2020](https://arxiv.org/abs/2005.08100)
