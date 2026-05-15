@@ -191,9 +191,16 @@ def run_inference(
 
     # ── Load ResNet ───────────────────────────────────────────────
     resnet = EEG_ResNet1D(cfg.n_feat, N_CLASSES).to(device)
-    resnet.load_state_dict(
-        torch.load(resnet_ckpt, map_location=device, weights_only=True)
-    )
+    try:
+        # Try weights_only first (PyTorch 2.0+)
+        resnet.load_state_dict(
+            torch.load(resnet_ckpt, map_location=device, weights_only=True)
+        )
+    except TypeError:
+        # Fallback for older PyTorch versions
+        resnet.load_state_dict(
+            torch.load(resnet_ckpt, map_location=device)
+        )
     resnet.eval()
     _log(cfg.log_cb, f"  ✓ ResNet loaded: {Path(resnet_ckpt).name}")
 
@@ -217,9 +224,16 @@ def run_inference(
         kernel_size=cfg.tcn_kernel_size, n_blocks=cfg.tcn_blocks,
         dropout=cfg.tcn_dropout, n_classes=N_CLASSES,
     ).to(device)
-    tcn.load_state_dict(
-        torch.load(tcn_ckpt, map_location=device, weights_only=True)
-    )
+    try:
+        # Try weights_only first (PyTorch 2.0+)
+        tcn.load_state_dict(
+            torch.load(tcn_ckpt, map_location=device, weights_only=True)
+        )
+    except TypeError:
+        # Fallback for older PyTorch versions
+        tcn.load_state_dict(
+            torch.load(tcn_ckpt, map_location=device)
+        )
     tcn.eval()
     _log(cfg.log_cb, f"  ✓ TCN loaded: {Path(tcn_ckpt).name}")
 

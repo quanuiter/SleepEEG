@@ -14,11 +14,15 @@ Gồm 5 tab:
 import json
 import sys
 from pathlib import Path
+import tempfile
 
 # Đảm bảo thư mục hiện tại nằm trong sys.path để import các module sibling
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
+
+# Default paths for Streamlit Cloud
+_DEFAULT_WEIGHT_DIR = str(_THIS_DIR / "weight")
 
 import numpy as np
 import streamlit as st
@@ -1098,18 +1102,18 @@ with tab5:
         # Auto-detect channels from uploaded file
         if uploaded_edf is not None and "inf_detected_chs" not in st.session_state:
             import tempfile, os
-            tmp_dir = os.path.join(os.path.dirname(__file__), "_tmp_inf")
-            os.makedirs(tmp_dir, exist_ok=True)
-            tmp_path = os.path.join(tmp_dir, uploaded_edf.name)
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded_edf.getbuffer())
             try:
-                from preprocess import list_edf_channels
-                detected = list_edf_channels(tmp_path)
-                if detected:
-                    st.session_state["inf_detected_chs"] = detected
-                    _inf_ch_options = detected
-            except Exception:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = os.path.join(tmp_dir, uploaded_edf.name)
+                    with open(tmp_path, "wb") as f:
+                        f.write(uploaded_edf.getbuffer())
+                    from pipeline.preprocess import list_edf_channels
+                    detected = list_edf_channels(tmp_path)
+                    if detected:
+                        st.session_state["inf_detected_chs"] = detected
+                        _inf_ch_options = detected
+            except Exception as e:
+                # Fallback to predefined channels if detection fails
                 pass
 
         if "inf_detected_chs" in st.session_state:
@@ -1138,13 +1142,16 @@ with tab5:
 
         # ── Model checkpoints ─────────────────────────────────────
         st.markdown("#### 🏗️ Checkpoints")
-        inf_ckpt_dir = st.text_input("Thư mục checkpoints", value="./results/checkpoints",
-                                     key="inf_ckpt_dir")
+        default_ckpt = st.session_state.get("inf_ckpt_dir", _DEFAULT_WEIGHT_DIR)
+        inf_ckpt_dir = st.text_input("Thư mục checkpoints", value=default_ckpt,
+                                     key="inf_ckpt_dir",
+                                     help="Mặc định: thư mục weight/ trong project")
 
         def _inf_list_ckpts(folder, pattern):
             try:
-                return sorted(Path(folder).glob(pattern)) if Path(folder).exists() else []
-            except OSError:
+                folder_path = Path(folder).expanduser().resolve()
+                return sorted(folder_path.glob(pattern)) if folder_path.exists() else []
+            except (OSError, ValueError):
                 return []
 
         inf_resnet_files = _inf_list_ckpts(inf_ckpt_dir, "resnet_fold*.pth")
@@ -1222,45 +1229,54 @@ with tab5:
             inf_log_ph.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
 
         try:
-            # Save uploaded file to temp
-            tmp_dir = os.path.join(os.path.dirname(__file__), "_tmp_inf")
-            os.makedirs(tmp_dir, exist_ok=True)
-            tmp_edf = os.path.join(tmp_dir, uploaded_edf.name)
-            with open(tmp_edf, "wb") as f:
-                f.write(uploaded_edf.getbuffer())
+            # Save uploaded file to temporary directory
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_edf = os.path.join(tmp_dir, uploaded_edf.name)
+                with open(tmp_edf, "wb") as f:
+                    f.write(uploaded_edf.getbuffer())
 
-            from inference import InferenceConfig, preprocess_raw_edf, run_inference
+                from inference import InferenceConfig, preprocess_raw_edf, run_inference
 
-            inf_cfg = InferenceConfig(
-                select_ch=inf_channel,
-                apply_bandpass=inf_bp, bp_low=inf_bp_lo, bp_high=inf_bp_hi, bp_order=4,
-                apply_notch=inf_notch, notch_freq=inf_notch_f, notch_q=inf_notch_q,
-                n_feat=int(inf_nfeat), tcn_dim=int(inf_tcn_dim),
-                tcn_kernel_size=int(inf_tcn_kernel), tcn_blocks=int(inf_tcn_blocks),
-                tcn_dropout=float(inf_tcn_drop),
-                log_cb=_ilog,
-            )
+                inf_cfg = InferenceConfig(
+                    select_ch=inf_channel,
+                    apply_bandpass=inf_bp, bp_low=inf_bp_lo, bp_high=inf_bp_hi, bp_order=4,
+                    apply_notch=inf_notch, notch_freq=inf_notch_f, notch_q=inf_notch_q,
+                    n_feat=int(inf_nfeat), tcn_dim=int(inf_tcn_dim),
+                    tcn_kernel_size=int(inf_tcn_kernel), tcn_blocks=int(inf_tcn_blocks),
+                    tcn_dropout=float(inf_tcn_drop),
+                    log_cb=_ilog,
+                )
 
-            inf_prog_ph.progress(0.1, text="Tiền xử lý ...")
-            signals, fs_orig, n_all_epochs, raw_epochs = preprocess_raw_edf(tmp_edf, inf_cfg)
+                inf_prog_ph.progress(0.1, text="Tiền xử lý ...")
+                signals, fs_orig, n_all_epochs, raw_epochs = preprocess_raw_edf(tmp_edf, inf_cfg)
 
-            inf_prog_ph.progress(0.4, text="Trích xuất đặc trưng + Phân lớp ...")
-            resnet_path = str(Path(inf_ckpt_dir) / inf_rn_pick)
-            tcn_path    = str(Path(inf_ckpt_dir) / inf_tcn_pick)
-            result = run_inference(signals, resnet_path, tcn_path, inf_cfg)
+                inf_prog_ph.progress(0.4, text="Trích xuất đặc trưng + Phân lớp ...")
+                resnet_path = str(Path(inf_ckpt_dir).expanduser().resolve() / inf_rn_pick)
+                tcn_path    = str(Path(inf_ckpt_dir).expanduser().resolve() / inf_tcn_pick)
+                
+                # Validate checkpoint files exist
+                if not Path(resnet_path).exists():
+                    raise FileNotFoundError(f"ResNet weights không tìm thấy: {resnet_path}")
+                if not Path(tcn_path).exists():
+                    raise FileNotFoundError(f"TCN weights không tìm thấy: {tcn_path}")
+                
+                result = run_inference(signals, resnet_path, tcn_path, inf_cfg)
 
-            # Store results
-            result["raw_epochs"]   = raw_epochs
-            result["signals"]      = signals
-            result["fs_orig"]      = fs_orig
-            result["n_all_epochs"] = n_all_epochs
-            result["edf_name"]     = uploaded_edf.name
-            st.session_state.infer_result = result
-            st.session_state.infer_done = True
+                # Store results
+                result["raw_epochs"]   = raw_epochs
+                result["signals"]      = signals
+                result["fs_orig"]      = fs_orig
+                result["n_all_epochs"] = n_all_epochs
+                result["edf_name"]     = uploaded_edf.name
+                st.session_state.infer_result = result
+                st.session_state.infer_done = True
 
-            _ilog(f"<b style='color:#00d4aa'>✓ Inference hoàn thành: {len(result['predictions'])} epochs</b>")
-            inf_prog_ph.progress(1.0, text="Hoàn thành!")
+                _ilog(f"<b style='color:#00d4aa'>✓ Inference hoàn thành: {len(result['predictions'])} epochs</b>")
+                inf_prog_ph.progress(1.0, text="Hoàn thành!")
 
+        except FileNotFoundError as e:
+            _ilog(f"<span style='color:#f85149'>✗ Lỗi tệp: {e}</span>")
+            _ilog(f"<span style='color:#f85149'>Hãy kiểm tra đường dẫn checkpoint và đảm bảo tệp tồn tại.</span>")
         except Exception as e:
             import traceback
             _ilog(f"<span style='color:#f85149'>✗ Lỗi: {e}</span>")
