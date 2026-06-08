@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - main
-    # Chỉ chạy pipeline khi có thay đổi trong thư mục PipelineEEG
-    paths:
-      - 'PipelineEEG/**'
 
   # Cho phép chạy bằng tay trên web Github
   workflow_dispatch:
@@ -32,7 +29,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git add .
           git commit -m "Auto Deploy from Github Actions"
-          git branch -M main
-          
-          # Force push toàn bộ thư mục PipelineEEG lên root của Hugging Face
-          git push https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE_NAME main --force
+          # Force push toàn bộ thư mục PipelineEEG lên nhánh main của Hugging Face
+          git push https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE_NAME HEAD:main --force
