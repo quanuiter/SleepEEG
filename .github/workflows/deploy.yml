@@ -28,11 +28,11 @@ jobs:
           cd PipelineEEG
           # Tạo một repo git ảo chỉ chứa code của PipelineEEG
           git init
-          git checkout -b main || git branch -M main
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add .
           git commit -m "Auto Deploy from Github Actions"
+          git branch -M main
           
           # Force push toàn bộ thư mục PipelineEEG lên root của Hugging Face
           git push https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE_NAME main --force
