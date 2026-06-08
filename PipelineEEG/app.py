@@ -1097,7 +1097,7 @@ if app_mode == "Phân loại giấc ngủ (Người dùng)":
             uploaded_edf = st.file_uploader(
                 "Chọn file EDF (PSG)", type=["edf"],
                 key="inf_edf_upload",
-                help="File EDF chứa tín hiệu EEG (ví dụ: *PSG.edf từ Sleep-EDF)",
+                help="File EDF chứa tín hiệu EEG (ví dụ: *PSG.edf từ Sleep-EDF) có thể tải file tín hiệu từ đây để test https://drive.google.com/file/d/11-HGaU8ARX9AS-4-8_7_Py3X1oFCreZJ/view?usp=drive_link",
             )
 
             # ── Channel selection ─────────────────────────────────────
