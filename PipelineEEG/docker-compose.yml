@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  sleep_eeg:
+    build: .
+    image: sleep_eeg_app
+    ports:
+      - "8501:8501"
+    volumes:
+      # Map thư mục weight ở ngoài máy thật vào /app/weight trong container
+      - ./weight:/app/weight
+    # Cấu hình để tự khởi động lại nếu lỗi
+    restart: unless-stopped

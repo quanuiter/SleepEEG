@@ -366,12 +366,12 @@ def _process_one(psg_fp, ann_fp, cfg, logger, out_path, label_reader, make_name)
     e_idx = min(len(y) - 1, nw_idx[-1] + cfg.w_edge_mins * 2)
     x, y  = x[s_idx:e_idx+1], y[s_idx:e_idx+1]
 
-    # Loại MOVE + UNK
-    rm = np.union1d(np.where(y == STAGE_DICT["MOVE"])[0],
-                    np.where(y == STAGE_DICT["UNK"])[0])
-    if len(rm):
-        keep = np.setdiff1d(np.arange(len(x)), rm)
-        x, y = x[keep], y[keep]
+    # MOVE / UNK → label -1 (giữ epoch tại chỗ, bảo toàn chuỗi thời gian)
+    # normalize_labels() trong trainer.py sẽ giữ -1;
+    # extract_features() đổi -1 → -100 → ignore_index trong CE loss bỏ qua.
+    mask = (y == STAGE_DICT["MOVE"]) | (y == STAGE_DICT["UNK"])
+    if mask.any():
+        y[mask] = -1
 
     save_name = make_name(psg_fp)
     save_path = out_path / save_name

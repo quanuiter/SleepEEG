@@ -286,6 +286,9 @@ def extract_features(records: List, resnet: nn.Module,
             xb = torch.from_numpy(sigs[i:i+batch_size]).unsqueeze(1).to(device)
             feats.append(resnet(xb, extract_features=True).cpu().numpy())
         del sigs  # giải phóng signal ngay sau khi extract
+        # Đổi nhãn rác (-1) → -100 (ignore_index cho CrossEntropy)
+        lbls = lbls.copy()
+        lbls[lbls == -1] = -100
         results.append((np.concatenate(feats, axis=0), lbls))
     return results
 
