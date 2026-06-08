@@ -27,6 +27,12 @@ jobs:
           git init
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+          
+          # Cấu hình Git LFS cho file trọng số model (.pth)
+          git lfs install
+          git lfs track "*.pth"
+          git add .gitattributes
+          
           git add .
           git commit -m "Auto Deploy from Github Actions"
           # Force push toàn bộ thư mục PipelineEEG lên nhánh main của Hugging Face
