@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Push to Hugging Face
         env:
@@ -28,6 +28,7 @@ jobs:
           cd PipelineEEG
           # Tạo một repo git ảo chỉ chứa code của PipelineEEG
           git init
+          git checkout -b main || git branch -M main
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add .
