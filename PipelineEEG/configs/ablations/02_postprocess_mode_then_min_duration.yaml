@@ -1,0 +1,11 @@
+# configs/ablations/02_postprocess_mode_then_min_duration.yaml
+# Mode filter (window=5) trước, sau đó min_duration=3. Catches quick
+# spikes mà min_duration alone có thể bỏ sót.
+
+extends: base.yaml
+
+postprocess:
+  enabled: true
+  methods: [mode, min_duration]
+  mode_window: 5
+  min_duration_epochs: 3

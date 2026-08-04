@@ -1,0 +1,19 @@
+# configs/ablations/11_signal_aug.yaml
+# Signal-level augmentation: Gaussian noise + time shift + amplitude
+# scale. Kỳ vọng +0.8-1.5% Acc, +1-2% MF1.
+
+extends: base.yaml
+
+augment:
+  enabled: true
+  apply_gaussian:   true
+  gaussian_std_min: 0.01
+  gaussian_std_max: 0.05
+  apply_time_shift: true
+  max_shift_seconds: 2.0
+  apply_amplitude:  true
+  amplitude_min:    0.9
+  amplitude_max:    1.1
+  apply_mixup:      false
+  mixup_alpha:      0.2
+  mixup_prob:       0.5

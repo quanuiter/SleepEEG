@@ -1,0 +1,9 @@
+# configs/ablations/01_postprocess_min_duration.yaml
+# AASM minimum-duration rule only. Expected +1-1.5% Acc, +1.5-2.5% MF1.
+
+extends: base.yaml
+
+postprocess:
+  enabled: true
+  methods: [min_duration]
+  min_duration_epochs: 3

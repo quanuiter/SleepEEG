@@ -1,0 +1,8 @@
+# configs/ablations/00_baseline.yaml
+# Baseline thuần: ResNet + TCN, CE có class weights, không augmentation,
+# không post-process, không joint fine-tune. Mục đích: reproduce
+# Acc 83.89% / MF1 78.53% (verified trên Sleep-EDF-78, 10-fold).
+
+extends: base.yaml
+
+# KHÔNG thay đổi gì — chỉ là baseline đối chứng

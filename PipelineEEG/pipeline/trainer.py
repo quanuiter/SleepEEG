@@ -15,7 +15,7 @@ import gc
 import json
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -29,6 +29,20 @@ from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset
 
 from pipeline.models import EEG_ResNet1D, SleepTCN
+from pipeline.postprocess import PostprocessConfig, postprocess_hypnogram
+# Lazy imports cho AugmentConfig/LossConfig (gọi ở default_factory) để tránh
+# circular nếu augment/losses sau này reference lại trainer.
+from pipeline.utils import (
+    config_hash,
+    derive_seed,
+    git_commit,
+    make_run_id,
+    safe_yaml_dump,
+    set_seed,
+    utc_now_iso,
+)
+from pipeline.augment import AugmentConfig
+from pipeline.losses import LossConfig
 
 SLEEP_STAGES  = ["W", "N1", "N2", "N3", "REM"]
 N_CLASSES     = 5
@@ -77,6 +91,28 @@ class PipelineConfig:
     finetune_lr:    float = 1e-4
     freeze_resnet:  bool  = True   # khi fine-tune: giữ nguyên ResNet weights
 
+    # Hypnogram post-processing (mặc định disabled).
+    # Khi enabled, evaluate_fold() trả về cả raw và postprocessed metrics,
+    # cho phép so sánh trong ablation table.
+    postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
+
+    # Loss function
+    loss: LossConfig = field(default_factory=LossConfig)
+
+    # Signal-level augmentation (mặc định disabled)
+    augment: AugmentConfig = field(default_factory=AugmentConfig)
+
+    # Joint end-to-end fine-tuning (mặc định disabled)
+    joint_finetune:    bool   = False
+    joint_lr_resnet:   float  = 1e-4
+    joint_lr_tcn:      float  = 5e-4
+    joint_epochs:      int    = 30
+    joint_patience:    int    = 12        # epoch unit
+    joint_val_every:   int    = 2
+    joint_batch_size:  int    = 1
+    joint_resnet_chunk: int   = 128       # epochs per ResNet fwd để tránh OOM
+    joint_freeze_bn:   bool   = True      # giữ BN ở eval mode (small batch)
+
     # Callbacks (Streamlit)
     log_cb:      Optional[Callable[[str], None]]           = field(default=None, repr=False)
     progress_cb: Optional[Callable[[int, int, str], None]] = field(default=None, repr=False)
@@ -88,11 +124,32 @@ class PipelineConfig:
 # ══════════════════════════════════════════════════════════════════
 
 class _EpochDataset(Dataset):
-    def __init__(self, signals, labels):
-        self.signals, self.labels = signals, labels
+    def __init__(self, signals, labels, augment_cfg: Optional["AugmentConfig"] = None,
+                 rng_seed: int = 0, fold: int = 0, prefix: str = "aug"):
+        """
+        signals: (N, 3000) float32
+        labels:  (N,) int64
+        augment_cfg: nếu enabled, áp augmentation per-sample
+        rng_seed/fold/prefix: dùng derive_seed() để tạo rng reproducible
+        """
+        self.signals = signals
+        self.labels  = labels
+        self.augment_cfg = augment_cfg
+
+        def _seed_for(i: int) -> int:
+            return derive_seed(rng_seed, fold, f"{prefix}_{i}")
+
+        self._seed_for = _seed_for
+
     def __len__(self): return len(self.labels)
+
     def __getitem__(self, idx):
-        x = torch.from_numpy(self.signals[idx].astype(np.float32)).unsqueeze(0)
+        x = self.signals[idx]
+        if self.augment_cfg is not None and self.augment_cfg.enabled:
+            from pipeline.augment import apply_epoch_augment
+            rng = np.random.default_rng(self._seed_for(idx))
+            x = apply_epoch_augment(x, rng, self.augment_cfg)
+        x = torch.from_numpy(x.astype(np.float32)).unsqueeze(0)
         y = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, y
 
@@ -297,12 +354,16 @@ def extract_features(records: List, resnet: nn.Module,
 # Train ResNet
 # ══════════════════════════════════════════════════════════════════
 
-def _collect_valid(records, max_epochs_per_rec: int = 300, max_total: int = 30_000):
+def _collect_valid(records, max_epochs_per_rec: int = 300, max_total: int = 30_000,
+                   rng: Optional[np.random.Generator] = None):
     """
     Load từng file, lấy valid epochs, ghép lại.
     max_epochs_per_rec : giới hạn epoch mỗi record (tránh OOM)
     max_total          : giới hạn tổng epoch (safety cap khi 200 SHHS files)
+    rng                : numpy Generator (mặc định dùng global np.random nếu None)
     """
+    if rng is None:
+        rng = np.random.default_rng()
     sigs_all, lbls_all = [], []
     total_so_far = 0
     for rec in records:
@@ -314,7 +375,7 @@ def _collect_valid(records, max_epochs_per_rec: int = 300, max_total: int = 30_0
         del sigs
         gc.collect()
         if len(sv) > max_epochs_per_rec:
-            idx = np.random.choice(len(sv), max_epochs_per_rec, replace=False)
+            idx = rng.choice(len(sv), max_epochs_per_rec, replace=False)
             sv, lv = sv[idx], lv[idx]
         room = max_total - total_so_far
         if len(sv) > room:
@@ -330,13 +391,14 @@ def train_resnet_fold(train_records: List, fold_idx: int,
     from sklearn.metrics import f1_score as sk_f1
 
     n_val = max(1, round(len(train_records) * cfg.resnet_val_ratio))
-    rng   = np.random.default_rng(42 + fold_idx)
+    # derive_seed: deterministic + không collide giữa các stage/folds
+    rng   = np.random.default_rng(derive_seed(cfg.seed, fold_idx, "resnet_split"))
     perm  = rng.permutation(len(train_records)).tolist()
     val_recs = [train_records[i] for i in perm[:n_val]]
     tr_recs  = [train_records[i] for i in perm[n_val:]]
 
-    X_train, y_train = _collect_valid(tr_recs)
-    X_val,   y_val   = _collect_valid(val_recs)
+    X_train, y_train = _collect_valid(tr_recs, rng=rng)
+    X_val,   y_val   = _collect_valid(val_recs, rng=rng)
 
     classes = np.unique(y_train)
     weights = compute_class_weight("balanced", classes=classes, y=y_train)
@@ -344,16 +406,40 @@ def train_resnet_fold(train_records: List, fold_idx: int,
 
     _log(cfg.log_cb, f"  ResNet | Train {len(y_train):,} / Val {len(y_val):,} epochs")
 
-    g = torch.Generator(); g.manual_seed(cfg.seed + fold_idx)
-    tr_ld = DataLoader(_EpochDataset(X_train, y_train),
-                       batch_size=cfg.resnet_batch_size, shuffle=True,
-                       generator=g, num_workers=2, pin_memory=(device.type == "cuda"))
-    vl_ld = DataLoader(_EpochDataset(X_val, y_val),
-                       batch_size=cfg.resnet_batch_size * 2, shuffle=False,
-                       num_workers=2, pin_memory=(device.type == "cuda"))
+    g = torch.Generator()
+    g.manual_seed(derive_seed(cfg.seed, fold_idx, "resnet_dataloader"))
+    tr_ld = DataLoader(
+        _EpochDataset(X_train, y_train, augment_cfg=cfg.augment,
+                      rng_seed=cfg.seed, fold=fold_idx, prefix="resnet_train"),
+        batch_size=cfg.resnet_batch_size, shuffle=True,
+        generator=g, num_workers=2, pin_memory=(device.type == "cuda"),
+    )
+    vl_ld = DataLoader(
+        # Validation KHÔNG augment (đo khả năng generalize, không đo aug quality)
+        _EpochDataset(X_val, y_val, augment_cfg=None),
+        batch_size=cfg.resnet_batch_size * 2, shuffle=False,
+        num_workers=2, pin_memory=(device.type == "cuda"),
+    )
 
     model     = EEG_ResNet1D(cfg.n_feat, N_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss(weight=cw)
+    # Build loss theo LossConfig (focal hoặc ce). class weights dùng
+    # compute_class_weights với scheme 'inverse_sqrt' (gentler hơn sklearn
+    # 'balanced' để tránh N1 weight quá lớn gây instability).
+    from pipeline.losses import compute_class_weights as _ccw
+    cw_np = _ccw(y_train.astype(np.int64), n_classes=N_CLASSES, scheme="inverse_sqrt")
+    cw_t  = torch.from_numpy(cw_np).to(device)
+    if cfg.loss.loss_type == "focal":
+        from pipeline.losses import FocalLoss
+        criterion = FocalLoss(
+            gamma=cfg.loss.focal_gamma,
+            alpha=cw_t if cfg.loss.use_class_weights else None,
+            ignore_index=-100,
+        )
+    else:
+        criterion = nn.CrossEntropyLoss(
+            weight=cw_t if cfg.loss.use_class_weights else None,
+            ignore_index=-100,
+        )
     optimizer = optim.AdamW(model.parameters(), lr=cfg.resnet_lr, weight_decay=1e-4)
 
     best_mf1, no_improve = -1.0, 0
@@ -409,7 +495,7 @@ def train_tcn_fold(train_feats: List, fold_idx: int,
     lr_override    : ghi đè learning rate (dùng khi fine-tune với lr nhỏ hơn)
     """
     n_val  = max(1, round(len(train_feats) * cfg.seq_val_ratio))
-    rng    = np.random.default_rng(99 + fold_idx)
+    rng    = np.random.default_rng(derive_seed(cfg.seed, fold_idx, "tcn_split"))
     perm   = rng.permutation(len(train_feats)).tolist()
     val_fl = [train_feats[i] for i in perm[:n_val]]
     tr_fl  = [train_feats[i] for i in perm[n_val:]]
@@ -479,21 +565,274 @@ def train_tcn_fold(train_feats: List, fold_idx: int,
 
 
 # ══════════════════════════════════════════════════════════════════
+# Joint fine-tuning: ResNet + TCN end-to-end
+# ══════════════════════════════════════════════════════════════════
+
+# Cấu hình joint fine-tune được nhúng vào PipelineConfig — xem dưới.
+
+
+class _RawSeqDataset(Dataset):
+    """
+    Lazy load raw signals từ NPZ, trả về (signals, labels) cho 1 record.
+
+    Đây là dạng dataset joint fine-tune cần: KHÔNG cache features như
+    `_EpochDataset` + `_SeqDataset` (cách cũ), vì cần gradient chạy qua
+    ResNet.
+    """
+
+    def __init__(self, records: List, cfg: PipelineConfig, fold: int):
+        self.records = records
+        self.cfg = cfg
+        self.fold = fold
+        # Lazy — chỉ load khi __getitem__
+        self.augment_cfg = getattr(cfg, "augment", None)
+        self._aug_rng_seed = cfg.seed
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        rec = self.records[idx]
+        sigs, lbls = load_npz(rec["fpath"])
+        lbls = lbls.astype(np.int64)
+        # -1 → -100 để match CE/Focal ignore_index
+        lbls[lbls < 0] = -100
+
+        # Augment per-record (1 rng per record → reproducible)
+        if self.augment_cfg is not None and self.augment_cfg.enabled:
+            from pipeline.augment import apply_epoch_augment
+            rng = np.random.default_rng(derive_seed(self._aug_rng_seed, self.fold, f"aug_{idx}"))
+            sigs_aug = np.empty_like(sigs, dtype=np.float32)
+            for i in range(len(sigs)):
+                sigs_aug[i] = apply_epoch_augment(sigs[i], rng, self.augment_cfg).astype(np.float32)
+            sigs = sigs_aug
+
+        return (
+            torch.from_numpy(sigs.astype(np.float32)).unsqueeze(1),  # (T, 1, 3000)
+            torch.from_numpy(lbls),
+        )
+
+
+def train_joint_fold(
+    train_records: List,
+    val_records:   List,
+    fold_idx: int,
+    cfg: PipelineConfig,
+    device: torch.device,
+    pretrained_resnet: Optional[nn.Module] = None,
+    pretrained_tcn:    Optional[nn.Module] = None,
+) -> Tuple[nn.Module, nn.Module]:
+    """
+    End-to-end fine-tune: ResNet + TCN với differential LR.
+
+    Khác với 2-stage:
+      - 2-stage: ResNet freeze → extract features 1 lần → train TCN
+      - Joint: ResNet cũng có gradient, TCN được feed bởi ResNet
+        features thật (không qua @torch.no_grad).
+
+    Args:
+        train_records     : list of dicts (file npz) cho training
+        val_records       : list of dicts cho early stop
+        fold_idx          : 0-based fold index (cho seed)
+        cfg               : PipelineConfig
+        device            : torch.device
+        pretrained_resnet : nếu None → khởi tạo fresh; thường nên truyền
+                            weights từ 2-stage để ổn định (warm start)
+        pretrained_tcn    : tương tự, từ 2-stage
+
+    Returns:
+        (resnet, tcn) sau khi train.
+    """
+    from pipeline.losses import build_loss, compute_class_weights
+
+    resnet = (pretrained_resnet if pretrained_resnet is not None
+              else EEG_ResNet1D(cfg.n_feat, N_CLASSES))
+    resnet = resnet.to(device)
+    tcn = (pretrained_tcn if pretrained_tcn is not None
+           else SleepTCN(input_size=cfg.n_feat, dim=cfg.tcn_dim,
+                          kernel_size=cfg.tcn_kernel_size, n_blocks=cfg.tcn_blocks,
+                          dropout=cfg.tcn_dropout, n_classes=N_CLASSES))
+    tcn = tcn.to(device)
+
+    # ── BatchNorm policy: nếu giữ ResNet frozen-ish thì nên eval mode
+    #    cho BN để tránh running stats drift trên batch nhỏ.
+    if getattr(cfg, "joint_freeze_bn", True):
+        for m in resnet.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+
+    # ── Loss: focal hoặc CE với class weights
+    # Compute class weights từ train labels
+    from pipeline.preprocess import read_labels_sleepedf
+    # Load labels nhanh (chỉ labels, không signals)
+    train_labels = []
+    for r in train_records:
+        try:
+            _, lbls = load_npz(r["fpath"])
+            lbls = lbls.astype(np.int64).ravel()
+            lbls = lbls[(lbls >= 0) & (lbls < 5)]
+            train_labels.append(lbls)
+        except Exception:
+            continue
+    all_lbls = np.concatenate(train_labels) if train_labels else np.array([], dtype=np.int64)
+    weights = (compute_class_weights(all_lbls, n_classes=N_CLASSES, scheme="inverse_sqrt")
+               if cfg.loss.use_class_weights and all_lbls.size > 0 else None)
+    loss_fn = build_loss(cfg.loss, weights)
+
+    # ── Differential LR
+    lr_resnet = float(getattr(cfg, "joint_lr_resnet", 1e-4))
+    lr_tcn    = float(getattr(cfg, "joint_lr_tcn",    5e-4))
+    optimizer = optim.AdamW([
+        {"params": [p for p in resnet.parameters() if p.requires_grad], "lr": lr_resnet},
+        {"params": [p for p in tcn.parameters()    if p.requires_grad], "lr": lr_tcn},
+    ], weight_decay=1e-3)
+
+    tr_ds = _RawSeqDataset(train_records, cfg, fold_idx)
+    vl_ds = _RawSeqDataset(val_records,   cfg, fold_idx)
+
+    pin = device.type == "cuda"
+    # Joint batch nhỏ vì 1 batch có thể 8 records × 1000 epochs × 3000 samples
+    bs = int(getattr(cfg, "joint_batch_size", 1))
+    tr_ld = DataLoader(tr_ds, batch_size=bs, shuffle=True,  num_workers=0, pin_memory=pin)
+    vl_ld = DataLoader(vl_ds, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin)
+
+    epochs = int(getattr(cfg, "joint_epochs", 30))
+    val_every = int(getattr(cfg, "joint_val_every", 2))
+    patience = int(getattr(cfg, "joint_patience", 6))
+
+    best_mf1, no_improve = -1.0, 0
+    best_resnet_state = copy.deepcopy(resnet.state_dict())
+    best_tcn_state    = copy.deepcopy(tcn.state_dict())
+
+    def _fwd_record(sigs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward 1 record: (T, 1, 3000) → ResNet → (T, n_feat) → TCN chunk.
+        Trả logits (T, 5).
+        """
+        T = sigs.shape[0]
+        # ResNet forward theo batch chunks để tránh OOM
+        chunk = int(getattr(cfg, "joint_resnet_chunk", 128))
+        feats = []
+        for s in range(0, T, chunk):
+            xb = sigs[s:s + chunk].to(device)
+            feats.append(resnet(xb, extract_features=True))
+        feats = torch.cat(feats, dim=0)              # (T, n_feat)
+        # TCN expects (B, T, D), B=1
+        logits = tcn(feats.unsqueeze(0)).squeeze(0)  # (T, 5)
+        return logits
+
+    for epoch in range(1, epochs + 1):
+        resnet.train(); tcn.train()
+        # Re-assert BN eval nếu cần
+        if getattr(cfg, "joint_freeze_bn", True):
+            for m in resnet.modules():
+                if isinstance(m, nn.BatchNorm1d):
+                    m.eval()
+
+        for sigs, lbls in tr_ld:
+            # sigs: (B, T, 1, 3000) ; lbls: (B, T)
+            B = sigs.shape[0]
+            sigs_flat = sigs.view(B * sigs.shape[1], 1, -1)  # (B*T, 1, 3000)
+            lbls_flat = lbls.view(-1)                        # (B*T,)
+
+            optimizer.zero_grad()
+            logits = _fwd_record(sigs_flat if B == 1 else sigs[:, 0])  # simplified: B=1 path
+            # Cho batch>1 chưa hỗ trợ: dùng loop
+            if B == 1:
+                loss = loss_fn(logits, lbls[0].to(device))
+            else:
+                # fallback: process từng record, sum loss
+                loss = 0.0
+                T = sigs.shape[1]
+                for b in range(B):
+                    logits_b = _fwd_record(sigs[b])
+                    loss = loss + loss_fn(logits_b, lbls[b].to(device))
+                loss = loss / B
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                [p for p in resnet.parameters() if p.requires_grad] +
+                [p for p in tcn.parameters()    if p.requires_grad],
+                1.0,
+            )
+            optimizer.step()
+
+        # ── Validation: tính MF1 thay vì val_loss (early stop tốt hơn cho imbalance)
+        if epoch % val_every == 0:
+            resnet.eval(); tcn.eval()
+            v_preds, v_trues = [], []
+            with torch.no_grad():
+                for sigs, lbls in vl_ld:
+                    B = sigs.shape[0]
+                    for b in range(B):
+                        logits = _fwd_record(sigs[b])
+                        valid = (lbls[b] >= 0) & (lbls[b] < N_CLASSES)
+                        v_preds.append(logits.argmax(dim=1).cpu().numpy()[valid])
+                        v_trues.append(lbls[b].numpy()[valid])
+            v_preds = np.concatenate(v_preds) if v_preds else np.array([], dtype=np.int64)
+            v_trues = np.concatenate(v_trues) if v_trues else np.array([], dtype=np.int64)
+            if v_trues.size > 0:
+                v_mf1 = float(f1_score(v_trues, v_preds, average="macro", zero_division=0))
+            else:
+                v_mf1 = 0.0
+
+            improved = v_mf1 > best_mf1 + 1e-4
+            if improved:
+                best_mf1, no_improve = v_mf1, 0
+                best_resnet_state = copy.deepcopy(resnet.state_dict())
+                best_tcn_state    = copy.deepcopy(tcn.state_dict())
+            else:
+                no_improve += 1
+
+            _log(cfg.log_cb,
+                 f"    Joint ep {epoch:3d}/{epochs}  val_MF1={v_mf1*100:.2f}%"
+                 + (" ← best" if improved else ""))
+
+            if no_improve * val_every >= patience:
+                _log(cfg.log_cb, f"    Joint early stop ep {epoch}  best_MF1={best_mf1*100:.2f}%")
+                break
+
+    resnet.load_state_dict(best_resnet_state)
+    tcn.load_state_dict(best_tcn_state)
+    return resnet, tcn
+
+
+# ══════════════════════════════════════════════════════════════════
 # Evaluate
 # ══════════════════════════════════════════════════════════════════
 
 def evaluate_fold(tcn: nn.Module, feat_lbl_list: List,
-                  device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+                  device: torch.device,
+                  return_probs: bool = False) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Predict trên tập test feats.
+
+    Returns:
+        preds:   (N,) predicted class indices
+        trues:   (N,) ground-truth labels (chỉ valid epochs)
+        probs:   (N, 5) softmax probabilities hoặc None nếu return_probs=False
+    """
     tcn.eval()
-    all_p, all_t = [], []
+    all_p, all_t, all_pr = [], [], []
     with torch.no_grad():
         for feats, lbls in feat_lbl_list:
             xb   = torch.from_numpy(feats.astype(np.float32)).unsqueeze(0).to(device)
-            pred = tcn(xb).squeeze(0).cpu().numpy().argmax(axis=1)
+            logits = tcn(xb).squeeze(0).cpu().numpy()              # (T, 5)
             valid = (lbls >= 0) & (lbls < N_CLASSES)
+            pred  = logits.argmax(axis=1)
             all_p.append(pred[valid])
             all_t.append(lbls[valid])
-    return np.concatenate(all_p), np.concatenate(all_t)
+            if return_probs:
+                # softmax ổn định
+                z = logits - logits.max(axis=1, keepdims=True)
+                e = np.exp(z)
+                probs = e / e.sum(axis=1, keepdims=True)
+                all_pr.append(probs[valid])
+    preds = np.concatenate(all_p)
+    trues = np.concatenate(all_t)
+    probs = np.concatenate(all_pr) if return_probs else None
+    return preds, trues, probs
 
 
 def compute_metrics(preds: np.ndarray, trues: np.ndarray) -> Dict:
@@ -520,6 +859,8 @@ def run_full_pipeline(
     train_resnet:    bool = True,
     train_tcn:       bool = True,
     fine_tune:       bool = False,           # fine-tune TCN trên data mới
+    run_id: Optional[str] = None,            # override auto-generated run_id
+    deterministic: bool = True,              # set CUDA deterministic flags
 ) -> List[Dict]:
     """
     Orchestrator. 3 kịch bản:
@@ -528,16 +869,73 @@ def run_full_pipeline(
     2. Eval chéo   : train_resnet=False, train_tcn=False, resnet_ckpt_dir=..., tcn_ckpt_dir=...
     3. Fine-tune   : train_resnet=False, train_tcn=True,  fine_tune=True,
                      resnet_ckpt_dir=... (freeze ResNet, train TCN với finetune_lr)
+
+    Reproducibility:
+      - set_seed(cfg.seed) ở đầu, CUDA deterministic nếu deterministic=True
+      - Mỗi run có run_id và lưu config + split_manifest vào output_dir
+      - Mọi RNG con đều dùng derive_seed(base, fold, stage) thay vì hard-code
     """
-    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-    ckpt_path = Path(cfg.ckpt_dir)
+    # 1. Seed mọi RNG ngay từ đầu (trước mọi DataLoader / Tensor)
+    set_seed(cfg.seed, deterministic=deterministic)
+
+    # 2. Sinh run_id và tạo output directory layout
+    cfg_dict = asdict(cfg)
+    # Loại bỏ callback không serializable
+    cfg_dict.pop("log_cb", None)
+    cfg_dict.pop("progress_cb", None)
+    cfg_dict.pop("metrics_cb", None)
+    chash = config_hash(cfg_dict)
+    if run_id is None:
+        run_id = make_run_id(cfg.seed, chash, prefix="pipeline")
+
+    output_dir = Path(cfg.output_dir) / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / "checkpoints"
     ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    # 3. Ghi config và meta của run (paper-ready)
+    (output_dir / "config.yaml").write_text(safe_yaml_dump(cfg_dict))
+    run_meta = {
+        "run_id": run_id,
+        "config_hash": chash,
+        "seed": int(cfg.seed),
+        "deterministic": bool(deterministic),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "device_name": (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        ),
+        "git_commit": git_commit(),
+        "created_at_utc": utc_now_iso(),
+    }
+    (output_dir / "meta.yaml").write_text(safe_yaml_dump(run_meta))
+    _log(cfg.log_cb, f"Run ID: {run_id}")
+    _log(cfg.log_cb, f"  Output: {output_dir}")
+
+    # Override output_dir/ckpt_dir để artifacts đi vào run_id subfolder
+    cfg.output_dir = str(output_dir)
+    cfg.ckpt_dir   = str(ckpt_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _log(cfg.log_cb, f"Device: {device}")
 
     subject_records, _ = load_all_records(cfg.npz_dir, cfg.log_cb)
     fold_groups = build_fold_groups(subject_records, cfg.n_folds, cfg.seed)
+
+    # Ghi split_manifest ngay sau khi fold_groups sẵn sàng
+    split_manifest = {
+        "run_id": run_id,
+        "config_hash": chash,
+        "seed": int(cfg.seed),
+        "n_folds": int(cfg.n_folds),
+        "folds": [
+            {"fold": int(i + 1), "test_subjects": list(g)} for i, g in enumerate(fold_groups)
+        ],
+        "all_subjects": sorted(subject_records.keys()),
+    }
+    (output_dir / "split_manifest.json").write_text(
+        json.dumps(split_manifest, indent=2)
+    )
 
     all_fold_metrics = []
     total        = len(fold_groups)
@@ -606,8 +1004,26 @@ def run_full_pipeline(
             _log(cfg.log_cb, "  ✓ Saved TCN checkpoint")
 
         # ── Evaluate ─────────────────────────────────────────────
-        preds, trues = evaluate_fold(tcn, test_feats, device)
-        m = compute_metrics(preds, trues)
+        # Khi post-process enabled, predict có cả raw và smoothed — cho phép
+        # so sánh trong paper / ablation table.
+        need_probs = bool(cfg.postprocess.enabled)
+        preds, trues, probs = evaluate_fold(
+            tcn, test_feats, device, return_probs=need_probs
+        )
+        m_raw = compute_metrics(preds, trues)
+        if probs is not None and cfg.postprocess.enabled:
+            smoothed = postprocess_hypnogram(preds, probs, cfg.postprocess)
+            m_smooth = compute_metrics(smoothed, trues)
+            n_changed = int(np.sum(smoothed != preds))
+            _log(cfg.log_cb,
+                 f"  Post-process [{','.join(cfg.postprocess.methods)}]: "
+                 f"{n_changed}/{len(preds)} epoch sửa, "
+                 f"MF1 {m_raw['mf1']*100:.2f}% → {m_smooth['mf1']*100:.2f}%")
+        else:
+            m_smooth = None
+            smoothed = preds
+
+        m = m_raw if m_smooth is None else m_smooth
         elapsed = time.time() - t0
 
         _log(cfg.log_cb,
@@ -619,6 +1035,9 @@ def run_full_pipeline(
             "test_subjects": test_sids,
             "n_test_epochs": len(trues),
             "elapsed_s": elapsed,
+            "raw_metrics":    m_raw,
+            "postprocess_metrics": m_smooth,
+            "postprocess_methods": list(cfg.postprocess.methods) if cfg.postprocess.enabled else [],
             **m,
         }
         all_fold_metrics.append(fold_result)

@@ -1,0 +1,80 @@
+# configs/base.yaml
+# Default configuration cho SleepEEG pipeline (legacy verified baseline).
+# Mọi ablation chỉ override các field muốn thay đổi; field khác inherit từ đây.
+
+# Paths
+npz_dir:    ./preprocessed
+output_dir: ./results
+ckpt_dir:   ./results/checkpoints
+
+# Fold
+n_folds: 10
+seed:    123
+
+# ResNet
+n_feat:            128
+resnet_lr:         1.0e-3
+resnet_batch_size: 64
+resnet_epochs:     40
+resnet_patience:   8
+resnet_val_ratio:  0.15
+
+# TCN architecture
+tcn_dim:         128
+tcn_kernel_size: 3
+tcn_blocks:      6
+tcn_dropout:     0.2
+
+# TCN training
+seq_lr:         5.0e-4
+seq_batch_size: 8
+seq_max_epochs: 300
+seq_patience:   30
+seq_val_every:  5
+seq_val_ratio:  0.10
+
+# Fine-tune
+finetune_lr:   1.0e-4
+freeze_resnet: true
+
+# Loss
+loss:
+  loss_type: ce                  # "ce" | "focal"
+  use_class_weights: true
+  weight_scheme: inverse_sqrt
+  focal_gamma: 2.0
+  focal_label_smoothing: 0.0
+
+# Augmentation (disabled mặc định)
+augment:
+  enabled: false
+  apply_gaussian:   false
+  gaussian_std_min: 0.0
+  gaussian_std_max: 0.05
+  apply_time_shift: false
+  max_shift_seconds: 2.0
+  apply_amplitude:  false
+  amplitude_min:    0.9
+  amplitude_max:    1.1
+  apply_mixup:      false
+  mixup_alpha:      0.2
+  mixup_prob:       0.5
+
+# Post-processing (disabled mặc định)
+postprocess:
+  enabled: false
+  methods: [min_duration]
+  mode_window: 5
+  min_duration_epochs: 3
+  use_hmm: false
+
+# Joint fine-tuning (disabled mặc định)
+joint_finetune:    false
+joint_lr_resnet:   1.0e-4
+joint_lr_tcn:      5.0e-4
+joint_epochs:      30
+joint_patience:    12
+joint_val_every:   2
+joint_batch_size:  1
+joint_resnet_chunk: 128
+joint_freeze_bn:   true

@@ -1,0 +1,15 @@
+# configs/ablations/20_joint_finetune.yaml
+# End-to-end joint fine-tuning: warm start từ 2-stage ResNet+TCN,
+# fine-tune cả hai với differential LR. Kỳ vọng +0.5-1% Acc, +1-1.5% MF1.
+
+extends: base.yaml
+
+joint_finetune:    true
+joint_lr_resnet:   1.0e-4
+joint_lr_tcn:      5.0e-4
+joint_epochs:      30
+joint_patience:    12
+joint_val_every:   2
+joint_batch_size:  1
+joint_resnet_chunk: 128
+joint_freeze_bn:   true

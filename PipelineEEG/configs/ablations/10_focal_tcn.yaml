@@ -1,0 +1,15 @@
+# configs/ablations/10_focal_tcn.yaml
+# Focal Loss với γ=2.0, có class weights. Kỳ vọng +1.5-2.5% N1 F1,
+# +0.2-0.5% Acc tổng.
+
+extends: base.yaml
+
+loss:
+  loss_type: ce                  # ResNet giữ CE (ổn định, ít data hơn)
+  use_class_weights: true
+  weight_scheme: inverse_sqrt
+  focal_gamma: 2.0
+  focal_label_smoothing: 0.0
+
+# NOTE: focal_gamma chỉ áp khi train_tcn_fold dùng focal.
+# run_ablation sẽ override loss_type=focal cho TCN phase.

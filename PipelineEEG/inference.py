@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 from pipeline.models import EEG_ResNet1D, SleepTCN
+from pipeline.postprocess import PostprocessConfig, postprocess_hypnogram
 from pipeline.preprocess import (
     TARGET_FS, EPOCH_SEC,
     bandpass_filter, notch_filter, clip_and_scale,
@@ -83,6 +84,11 @@ class InferenceConfig:
 
     # Callback
     log_cb: Optional[Callable[[str], None]] = field(default=None, repr=False)
+
+    # Hypnogram post-processing (disabled mặc định để backward-compatible).
+    # Khi enabled, run_inference() trả thêm "raw_predictions" và
+    # "postprocessed_predictions" để so sánh.
+    postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -235,6 +241,20 @@ def run_inference(
     predictions = logits.argmax(axis=1)                # (T,)
     stage_names = [SLEEP_STAGES[p] for p in predictions]
 
+    # ── Post-processing (optional) ────────────────────────────────
+    raw_predictions = predictions.copy()
+    if cfg.postprocess.enabled:
+        smoothed = postprocess_hypnogram(raw_predictions, probabilities, cfg.postprocess)
+        if not np.array_equal(smoothed, raw_predictions):
+            n_changed = int(np.sum(smoothed != raw_predictions))
+            _log(cfg.log_cb,
+                 f"  ✓ Post-process [{','.join(cfg.postprocess.methods)}]: "
+                 f"{n_changed}/{len(raw_predictions)} epoch bị sửa")
+        predictions = smoothed
+        stage_names = [SLEEP_STAGES[p] for p in predictions]
+    else:
+        smoothed = raw_predictions
+
     del tcn
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -248,11 +268,13 @@ def run_inference(
     _log(cfg.log_cb, f"  Phân bố: {dist}")
 
     return {
-        "predictions":   predictions,
-        "stage_names":   stage_names,
-        "probabilities": probabilities,
-        "features":      features,
-        "stage_dist":    dist,
+        "predictions":             predictions,
+        "raw_predictions":         raw_predictions,
+        "stage_names":             stage_names,
+        "probabilities":           probabilities,
+        "features":                features,
+        "stage_dist":              dist,
+        "postprocess_applied":     bool(cfg.postprocess.enabled),
     }
 
 

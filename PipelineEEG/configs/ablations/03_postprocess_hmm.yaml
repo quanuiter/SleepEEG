@@ -1,0 +1,12 @@
+# configs/ablations/03_postprocess_hmm.yaml
+# 5-state HMM Viterbi smoothing. Cần transition matrix ước lượng từ
+# train subjects — script run_ablation sẽ tự tính per-fold rồi truyền
+# vào qua PostprocessConfig.transition_matrix.
+
+extends: base.yaml
+
+postprocess:
+  enabled: true
+  methods: [hmm]
+  # transition_matrix_path: ./results/transition_matrices/fold{fold}.npy
+  # (script sẽ tự thay {fold})

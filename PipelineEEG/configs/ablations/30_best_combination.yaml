@@ -1,0 +1,37 @@
+# configs/ablations/30_best_combination.yaml
+# Best combination sau khi ablation screening. Thường là signal aug +
+# Focal TCN + min-duration post-process. Final config cho paper.
+
+extends: base.yaml
+
+# 1) Signal augmentation
+augment:
+  enabled: true
+  apply_gaussian:   true
+  gaussian_std_min: 0.01
+  gaussian_std_max: 0.05
+  apply_time_shift: true
+  max_shift_seconds: 2.0
+  apply_amplitude:  true
+  amplitude_min:    0.9
+  amplitude_max:    1.1
+  apply_mixup:      false
+
+# 2) Focal Loss cho TCN
+loss:
+  loss_type: ce                  # ResNet: CE ổn định
+  use_class_weights: true
+  weight_scheme: inverse_sqrt
+  focal_gamma: 2.0
+
+# 3) Min-duration post-process
+postprocess:
+  enabled: true
+  methods: [min_duration]
+  min_duration_epochs: 3
+
+# 4) Joint fine-tune (chỉ khi ablation cho thấy cải thiện)
+joint_finetune:    false         # toggle True nếu screening cho thấy win
+joint_lr_resnet:   1.0e-4
+joint_lr_tcn:      5.0e-4
+joint_epochs:      20
